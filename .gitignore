@@ -1,4 +1,6 @@
-data/
+data/synthetic
+data/photos
+data/fonts
 .vscode/
 __pycache__/
 *.pyc

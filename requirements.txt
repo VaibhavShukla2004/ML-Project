@@ -1,3 +1,5 @@
+Faker==40.4.0
+image2pdf==1.0.0
 numpy==2.4.2
 opencv-python==4.13.0.92
 pillow==12.1.1
