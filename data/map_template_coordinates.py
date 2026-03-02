@@ -6,7 +6,7 @@ def get_coordinates(event, x, y, flags, param):
         print(f"Target Coordinate: (X: {x}, Y: {y})")
 
 # Load your exported Canva template
-image_path = 'data/synthetic/base_template_v1.png' 
+image_path = 'templates/base_template_v1.png' 
 img = cv2.imread(image_path)
 
 if img is None:

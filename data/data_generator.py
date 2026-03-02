@@ -6,14 +6,14 @@ from io import BytesIO
 
 # Define template coordinates for text and photo placement
 TEMPLATE_COORDINATES ={
-    'name': (700, 320),
+    'name': (690, 310),
     'photo': (75, 250),
     'photo_size': (245, 375),
-    'dob': (700, 460),
-    'country': (696, 740),
-    'citizen_id': (700, 600),
-    'date_of_issue': (700, 880),
-    'date_of_expiry': (700, 1020)
+    'dob': (690, 440),
+    'country': (690, 690),
+    'citizen_id': (690, 570),
+    'date_of_issue': (690, 810),
+    'date_of_expiry': (690, 960)
 }
 
 # Synthetic Data Generator Class
@@ -23,13 +23,16 @@ class SyntheticDataGenerator:
     def __init__(self, num_records):
         self.num_records = num_records
         self.faker = Faker()
+        self.data = {}  # Store lookup for all citizen data (name, dob, country, dates, etc.)
         self.authentic_dir = os.path.join(os.getcwd(), 'synthetic', 'generated', 'authentic')
         self.forged_dir = os.path.join(os.getcwd(), 'synthetic', 'generated', 'forged')
+        self.masks_dir = os.path.join(os.getcwd(), 'synthetic', 'generated', 'masks')
         self.font_dir = os.path.join(os.getcwd(), 'fonts')
-        self.photos_dir = os.path.join(os.getcwd(), 'photos')
+        self.photos_dir = os.path.join(os.getcwd(), 'photos', 'cfd')
         self.template_path = os.path.join(os.getcwd(), 'templates', 'base_template_v1.png')
         os.makedirs(self.authentic_dir, exist_ok=True)
         os.makedirs(self.forged_dir, exist_ok=True)
+        os.makedirs(self.masks_dir, exist_ok=True)
         self.font_main = ImageFont.truetype(os.path.join(self.font_dir, "LiberationSans-Regular.ttf"), 42)
         self.font_mono = ImageFont.truetype(os.path.join(self.font_dir, "LiberationMono-Regular.ttf"), 46)
 
@@ -54,6 +57,8 @@ class SyntheticDataGenerator:
                 'date_of_expiry': date_of_expiry.strftime('%d %b %Y').upper(),
                 'name': name
             }
+        # Store the data as instance variable for use in forgery functions
+        self.data = data
         print(f"Generated {len(data)} synthetic records.")
         return data
     
@@ -101,10 +106,10 @@ class SyntheticDataGenerator:
         # Get list of authentic ID cards and available face photos
         authentic_cards = [f for f in os.listdir(self.authentic_dir) if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
         available_faces = [f for f in os.listdir(self.photos_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        train_dir = os.path.join(self.forged_dir, 'train', 'images')
-        train_masks_dir = os.path.join(self.forged_dir, 'train', 'masks')
-        os.makedirs(train_dir, exist_ok=True)
-        os.makedirs(train_masks_dir, exist_ok=True)
+        
+        # Ensure output directories exist
+        os.makedirs(self.forged_dir, exist_ok=True)
+        os.makedirs(self.masks_dir, exist_ok=True)
         
         if not authentic_cards:
             print("No authentic ID cards found. Please generate authentic cards first.")
@@ -113,162 +118,236 @@ class SyntheticDataGenerator:
         if not available_faces:
             print("No photos found in the photos directory.")
             return
-
+        
+        # Validate total forged count doesn't exceed available authentic cards
+        total_forged = sum(class_counts.values())
+        if total_forged > len(authentic_cards):
+            raise ValueError(f"Total forged count ({total_forged}) exceeds available authentic cards ({len(authentic_cards)}). "
+                           f"Maximum possible: {len(authentic_cards)}")
+        
+        # Check for class imbalance (warn if max/min ratio > 3)
+        class_values = [class_counts.get(cls, 0) for cls in [1, 2, 3, 4, 5]]
+        non_zero_classes = [v for v in class_values if v > 0]
+        if non_zero_classes:
+            max_class = max(non_zero_classes)
+            min_class = min(non_zero_classes)
+            balance_ratio = max_class / min_class if min_class > 0 else float('inf')
+            if balance_ratio > 3:
+                print(f"WARNING: Class imbalance detected! Max/Min ratio: {balance_ratio:.2f}x")
+                print(f"         Consider more balanced distribution: {class_counts}")
+        
+        # Initialize face cycling to avoid excessive repetition
+        # Each face will appear at most twice before all 600 faces are exhausted
+        shuffled_faces = available_faces.copy()
+        random.shuffle(shuffled_faces)
+        face_index = 0
+        
+        def get_next_face():
+            nonlocal face_index, shuffled_faces
+            if face_index >= len(shuffled_faces):
+                shuffled_faces = available_faces.copy()
+                random.shuffle(shuffled_faces)
+                face_index = 0
+            face = shuffled_faces[face_index]
+            face_index += 1
+            return face
+        
+        # Distribute authentic cards cyclically to prevent same card from being used multiple times
+        random.shuffle(authentic_cards)
+        card_index = 0
+        
+        def get_next_authentic_card():
+            nonlocal card_index
+            if card_index >= len(authentic_cards):
+                card_index = 0  # Wrap around if necessary (only happens if total_forged == len(authentic_cards))
+            card = authentic_cards[card_index]
+            card_index += 1
+            return card
+        
         # Class 1: Photo Replacement - Replace the original photo with a random face from the photos directory, after 60% compression to simulate quality loss
         class_1_count = class_counts.get(1, 0)
-        print(f"Generating {class_1_count} Class 1 forged ID cards (Photo Replacement)...")
-        
-        for i in range(class_1_count):
-            # Select a random authentic ID card
-            authentic_card_filename = random.choice(authentic_cards)
-            authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+        if class_1_count > 0:
+            print(f"Generating {class_1_count} Class 1 forged ID cards (Photo Replacement)...")
             
-            # Open the authentic ID card
-            id_card = Image.open(authentic_card_path).convert("RGB")
+            for i in range(class_1_count):
+                # Deterministically cycle through authentic cards
+                authentic_card_filename = get_next_authentic_card()
+                authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+                
+                # Open the authentic ID card
+                id_card = Image.open(authentic_card_path).convert("RGB")
+                
+                # Cycle through faces to avoid heavy repetition
+                face_image_filename = get_next_face()
+                face_image = Image.open(os.path.join(self.photos_dir, face_image_filename)).convert("RGB")
+                
+                # Resize the face to match the photo dimensions
+                face_image = face_image.resize(TEMPLATE_COORDINATES['photo_size'], Image.Resampling.LANCZOS)
+                
+                # Compress the face to 60% quality in memory
+                compressed_face_buffer = BytesIO()
+                face_image.save(compressed_face_buffer, "JPEG", quality=60)
+                compressed_face_buffer.seek(0)
+                compressed_face = Image.open(compressed_face_buffer).convert("RGB")
+                
+                # Paste the compressed face over the photo coordinates
+                id_card.paste(compressed_face, TEMPLATE_COORDINATES['photo'])
+                
+                # Save the forged ID card
+                forged_filename = f"class1_{i+1:04d}.jpg"
+                output_path = os.path.join(self.forged_dir, forged_filename)
+                id_card.save(output_path, "JPEG", quality=90)
+                
+                # Create a binary mask showing the forged region (white = forged, black = authentic)
+                mask = Image.new("L", id_card.size, 0)  # Black background
+                draw_mask = ImageDraw.Draw(mask)
+                photo_x, photo_y = TEMPLATE_COORDINATES['photo']
+                photo_w, photo_h = TEMPLATE_COORDINATES['photo_size']
+                draw_mask.rectangle([photo_x, photo_y, photo_x + photo_w, photo_y + photo_h], fill=255)
+                
+                mask_path = os.path.join(self.masks_dir, forged_filename.replace('.jpg', '_mask.png'))
+                mask.save(mask_path, "PNG")
             
-            # Select a random face image
-            random_face = random.choice(available_faces)
-            face_image = Image.open(os.path.join(self.photos_dir, random_face)).convert("RGB")
-            
-            # Resize the face to match the photo dimensions
-            face_image = face_image.resize(TEMPLATE_COORDINATES['photo_size'], Image.Resampling.LANCZOS)
-            
-            # Compress the face to 60% quality in memory
-            compressed_face_buffer = BytesIO()
-            face_image.save(compressed_face_buffer, "JPEG", quality=60)
-            compressed_face_buffer.seek(0)
-            compressed_face = Image.open(compressed_face_buffer).convert("RGB")
-            
-            # Paste the compressed face over the photo coordinates
-            id_card.paste(compressed_face, TEMPLATE_COORDINATES['photo'])
-            
-            # Save the forged ID card
-            forged_filename = f"class1_{i+1:04d}.jpg"
-            output_path = os.path.join(train_dir, forged_filename)
-            id_card.save(output_path, "JPEG", quality=90)
-            
-            # Create a binary mask showing the forged region (white = forged, black = authentic)
-            mask = Image.new("L", id_card.size, 0)  # Black background
-            draw_mask = ImageDraw.Draw(mask)
-            photo_x, photo_y = TEMPLATE_COORDINATES['photo']
-            photo_w, photo_h = TEMPLATE_COORDINATES['photo_size']
-            draw_mask.rectangle([photo_x, photo_y, photo_x + photo_w, photo_y + photo_h], fill=255)
-            
-            mask_path = os.path.join(train_masks_dir, forged_filename.replace('.jpg', '_mask.png'))
-            mask.save(mask_path, "PNG")
-        
-        print(f"Generated {class_1_count} Class 1 forged ID cards in {train_dir}")
+            print(f"Generated {class_1_count} Class 1 forged ID cards in {self.forged_dir}")
 
         # Class 2: Text Alteration (Name) - Erase the original name and replace with a new one with slight misalignment
         class_2_count = class_counts.get(2, 0)
-        print(f"Generating {class_2_count} Class 2 forged ID cards (Name Alteration)...")
-        
-        for i in range(class_2_count):
-            # Select a random authentic ID card
-            authentic_card_filename = random.choice(authentic_cards)
-            authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+        if class_2_count > 0:
+            print(f"Generating {class_2_count} Class 2 forged ID cards (Name Alteration)...")
             
-            # Open the authentic ID card
-            id_card = Image.open(authentic_card_path).convert("RGB")
+            for i in range(class_2_count):
+                # Deterministically cycle through authentic cards
+                authentic_card_filename = get_next_authentic_card()
+                authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+                
+                # Extract citizen_id from filename (remove extension)
+                citizen_id = os.path.splitext(authentic_card_filename)[0]
+                
+                # Open the authentic ID card
+                id_card = Image.open(authentic_card_path).convert("RGB")
+                
+                # Get the name coordinates
+                name_x, name_y = TEMPLATE_COORDINATES['name']
+                
+                # Get the original name from the lookup to calculate exact erase box size
+                original_name = self.data.get(citizen_id, {}).get('name', 'PLACEHOLDER_NAME')
+                
+                # Draw text to calculate bounding box of the ACTUAL original name
+                test_draw = ImageDraw.Draw(id_card)
+                test_bbox = test_draw.textbbox((name_x, name_y), original_name, font=self.font_main)
+                name_width = test_bbox[2] - test_bbox[0]
+                name_height = test_bbox[3] - test_bbox[1]
+                
+                # Define padding around the name for the erase patch
+                padding = 10
+                erase_box = (name_x - padding, name_y - padding, name_x + name_width + padding, name_y + name_height + padding)
+                
+                # Open the pristine blank template to steal a matching background patch
+                clean_template = Image.open(self.template_path).convert("RGB")
+                
+                # Extract the exact matching background from the clean template
+                erase_box_int = (int(erase_box[0]), int(erase_box[1]), int(erase_box[2]), int(erase_box[3]))
+                texture_patch = clean_template.crop(erase_box_int)
+                
+                # Paste the perfect texture patch over the original name to erase it
+                id_card.paste(texture_patch, erase_box_int)
+                
+                # Generate a new name
+                new_name = self.faker.name().upper()
+                
+                # Draw the new name with a slight Y shift (simulate human misalignment)
+                draw = ImageDraw.Draw(id_card)
+                new_name_y = name_y + 2  # Shift Y by 2 pixels
+                text_color = "#1a1a1a"
+                draw.text((name_x, new_name_y), new_name, font=self.font_main, fill=text_color)
+                
+                # Save the forged ID card
+                forged_filename = f"class2_{i+1:04d}.jpg"
+                output_path = os.path.join(self.forged_dir, forged_filename)
+                id_card.save(output_path, "JPEG", quality=90)
+                
+                # Create a binary mask showing the forged region (white = forged, black = authentic)
+                mask = Image.new("L", id_card.size, 0)  # Black background
+                draw_mask = ImageDraw.Draw(mask)
+                draw_mask.rectangle(erase_box_int, fill=255)
+                
+                mask_path = os.path.join(self.masks_dir, forged_filename.replace('.jpg', '_mask.png'))
+                mask.save(mask_path, "PNG")
             
-            # Get the name coordinates
-            name_x, name_y = TEMPLATE_COORDINATES['name']
-            
-            # Draw text to calculate bounding box of a typical name
-            test_draw = ImageDraw.Draw(id_card)
-            test_bbox = test_draw.textbbox((name_x, name_y), "PLACEHOLDER_NAME", font=self.font_main)
-            name_width = test_bbox[2] - test_bbox[0]
-            name_height = test_bbox[3] - test_bbox[1]
-            
-            # Define padding around the name for the erase patch
-            padding = 10
-            erase_box = (name_x - padding, name_y - padding, name_x + name_width + padding, name_y + name_height + padding)
-            
-            # Open the pristine blank template to steal a matching background patch
-            clean_template = Image.open(self.template_path).convert("RGB")
-            
-            # Extract the exact matching background from the clean template
-            erase_box_int = (int(erase_box[0]), int(erase_box[1]), int(erase_box[2]), int(erase_box[3]))
-            texture_patch = clean_template.crop(erase_box_int)
-            
-            # Paste the perfect texture patch over the original name to erase it
-            id_card.paste(texture_patch, erase_box_int)
-            
-            # Generate a new name
-            new_name = self.faker.name().upper()
-            
-            # Draw the new name with a slight Y shift (simulate human misalignment)
-            draw = ImageDraw.Draw(id_card)
-            new_name_y = name_y + 2  # Shift Y by 2 pixels
-            text_color = "#1a1a1a"
-            draw.text((name_x, new_name_y), new_name, font=self.font_main, fill=text_color)
-            
-            # Save the forged ID card
-            forged_filename = f"class2_{i+1:04d}.jpg"
-            output_path = os.path.join(train_dir, forged_filename)
-            id_card.save(output_path, "JPEG", quality=90)
-            
-            # Create a binary mask showing the forged region (white = forged, black = authentic)
-            mask = Image.new("L", id_card.size, 0)  # Black background
-            draw_mask = ImageDraw.Draw(mask)
-            draw_mask.rectangle(erase_box_int, fill=255)
-            
-            mask_path = os.path.join(train_masks_dir, forged_filename.replace('.jpg', '_mask.png'))
-            mask.save(mask_path, "PNG")
-        
-        print(f"Generated {class_2_count} Class 2 forged ID cards in {train_dir}")
+            print(f"Generated {class_2_count} Class 2 forged ID cards in {self.forged_dir}")
+
+        # Class 3: [Placeholder for future forgery class]
+        class_3_count = class_counts.get(3, 0)
+        if class_3_count > 0:
+            print(f"Generating {class_3_count} Class 3 forged ID cards...")
+            # TODO: Implement Class 3 forgery logic
+            for i in range(class_3_count):
+                authentic_card_filename = get_next_authentic_card()
+                # TODO: Add Class 3 implementation
+            print(f"Generated {class_3_count} Class 3 forged ID cards in {self.forged_dir}")
 
         # Class 4: Region Overlay (Date of Expiry) - Cover the entire Date of Expiry area with white rectangle and write a fake date
         class_4_count = class_counts.get(4, 0)
-        print(f"Generating {class_4_count} Class 4 forged ID cards (Region Overlay)...")
-        
-        for i in range(class_4_count):
-            # Select a random authentic ID card
-            authentic_card_filename = random.choice(authentic_cards)
-            authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+        if class_4_count > 0:
+            print(f"Generating {class_4_count} Class 4 forged ID cards (Region Overlay)...")
             
-            # Open the authentic ID card
-            id_card = Image.open(authentic_card_path).convert("RGB")
+            for i in range(class_4_count):
+                # Deterministically cycle through authentic cards
+                authentic_card_filename = get_next_authentic_card()
+                authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+                
+                # Open the authentic ID card
+                id_card = Image.open(authentic_card_path).convert("RGB")
+                
+                # Get the date of expiry coordinates
+                expiry_x, expiry_y = TEMPLATE_COORDINATES['date_of_expiry']
+                
+                # Calculate bounding box for the date of expiry field
+                test_draw = ImageDraw.Draw(id_card)
+                test_bbox = test_draw.textbbox((expiry_x, expiry_y), "99 DEC 2099", font=self.font_main)
+                expiry_width = test_bbox[2] - test_bbox[0]
+                expiry_height = test_bbox[3] - test_bbox[1]
+                
+                # Define padded bounding box to cover the entire area (including guilloche)
+                padding = 15
+                overlay_box = (int(expiry_x - padding), int(expiry_y - padding), 
+                              int(expiry_x + expiry_width + padding), int(expiry_y + expiry_height + padding))
+                
+                # Draw a solid white rectangle over the date of expiry area
+                draw = ImageDraw.Draw(id_card)
+                draw.rectangle(overlay_box, fill=(255, 255, 255))
+                
+                # Generate a fake date of expiry
+                fake_issue_date = self.faker.date_between(start_date='-10y', end_date='today')
+                fake_expiry_date = fake_issue_date.replace(year=fake_issue_date.year + 10)
+                fake_expiry_str = fake_expiry_date.strftime('%d %b %Y').upper()
+                
+                # Draw the new date on top of the white rectangle
+                text_color = "#1a1a1a"
+                draw.text((expiry_x, expiry_y), fake_expiry_str, font=self.font_main, fill=text_color)
+                
+                # Save the forged ID card
+                forged_filename = f"class4_{i+1:04d}.jpg"
+                output_path = os.path.join(self.forged_dir, forged_filename)
+                id_card.save(output_path, "JPEG", quality=90)
+                
+                # Create a binary mask showing the forged region (white = forged, black = authentic)
+                mask = Image.new("L", id_card.size, 0)  # Black background
+                draw_mask = ImageDraw.Draw(mask)
+                draw_mask.rectangle(overlay_box, fill=255)
+                
+                mask_path = os.path.join(self.masks_dir, forged_filename.replace('.jpg', '_mask.png'))
+                mask.save(mask_path, "PNG")
             
-            # Get the date of expiry coordinates
-            expiry_x, expiry_y = TEMPLATE_COORDINATES['date_of_expiry']
-            
-            # Calculate bounding box for the date of expiry field
-            test_draw = ImageDraw.Draw(id_card)
-            test_bbox = test_draw.textbbox((expiry_x, expiry_y), "99 DEC 2099", font=self.font_main)
-            expiry_width = test_bbox[2] - test_bbox[0]
-            expiry_height = test_bbox[3] - test_bbox[1]
-            
-            # Define padded bounding box to cover the entire area (including guilloche)
-            padding = 15
-            overlay_box = (int(expiry_x - padding), int(expiry_y - padding), 
-                          int(expiry_x + expiry_width + padding), int(expiry_y + expiry_height + padding))
-            
-            # Draw a solid white rectangle over the date of expiry area
-            draw = ImageDraw.Draw(id_card)
-            draw.rectangle(overlay_box, fill=(255, 255, 255))
-            
-            # Generate a fake date of expiry
-            fake_issue_date = self.faker.date_between(start_date='-10y', end_date='today')
-            fake_expiry_date = fake_issue_date.replace(year=fake_issue_date.year + 10)
-            fake_expiry_str = fake_expiry_date.strftime('%d %b %Y').upper()
-            
-            # Draw the new date on top of the white rectangle
-            text_color = "#1a1a1a"
-            draw.text((expiry_x, expiry_y), fake_expiry_str, font=self.font_main, fill=text_color)
-            
-            # Save the forged ID card
-            forged_filename = f"class4_{i+1:04d}.jpg"
-            output_path = os.path.join(train_dir, forged_filename)
-            id_card.save(output_path, "JPEG", quality=90)
-            
-            # Create a binary mask showing the forged region (white = forged, black = authentic)
-            mask = Image.new("L", id_card.size, 0)  # Black background
-            draw_mask = ImageDraw.Draw(mask)
-            draw_mask.rectangle(overlay_box, fill=255)
-            
-            mask_path = os.path.join(train_masks_dir, forged_filename.replace('.jpg', '_mask.png'))
-            mask.save(mask_path, "PNG")
-        
-        print(f"Generated {class_4_count} Class 4 forged ID cards in {train_dir}")
+            print(f"Generated {class_4_count} Class 4 forged ID cards in {self.forged_dir}")
+
+        # Class 5: [Placeholder for future forgery class]
+        class_5_count = class_counts.get(5, 0)
+        if class_5_count > 0:
+            print(f"Generating {class_5_count} Class 5 forged ID cards...")
+            # TODO: Implement Class 5 forgery logic
+            for i in range(class_5_count):
+                authentic_card_filename = get_next_authentic_card()
+                # TODO: Add Class 5 implementation
+            print(f"Generated {class_5_count} Class 5 forged ID cards in {self.forged_dir}")
 
