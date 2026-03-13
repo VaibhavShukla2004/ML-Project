@@ -1,6 +1,7 @@
+import calendar
 from faker import Faker
 import random
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance
 import os
 from io import BytesIO
 
@@ -16,12 +17,36 @@ TEMPLATE_COORDINATES ={
     'date_of_expiry': (690, 960)
 }
 
+# Shared artifact settings used by text-forgery classes
+FORGERY_ARTIFACT_CONFIG = {
+    'patch_jpeg_quality': 78,
+    'forged_jpeg_quality': 90,
+    'patch_brightness_range': (0.97, 1.03),
+    'name_y_jitter_range': (1, 2),
+    'expiry_y_jitter_range': (0, 2),
+    'name_patch_padding': 10,
+    'expiry_patch_padding': 15,
+}
+
+
+def add_years_safe(date_value, years):
+    """Add calendar years without failing on leap-day or short-month edge cases."""
+    target_year = date_value.year + years
+    try:
+        return date_value.replace(year=target_year)
+    except ValueError:
+        last_day = calendar.monthrange(target_year, date_value.month)[1]
+        return date_value.replace(year=target_year, day=min(date_value.day, last_day))
+
 # Synthetic Data Generator Class
 class SyntheticDataGenerator:
 
     #Define directories and load fonts in the constructor, also initialize Faker instance for data generation
-    def __init__(self, num_records):
+    def __init__(self, num_records, text_forgery_artifact_config=None):
         self.num_records = num_records
+        self.artifact_cfg = FORGERY_ARTIFACT_CONFIG.copy()
+        if text_forgery_artifact_config:
+            self.artifact_cfg.update(text_forgery_artifact_config)
         self.faker = Faker()
         self.data = {}  # Store lookup for all citizen data (name, dob, country, dates, etc.)
         self.authentic_dir = os.path.join(os.getcwd(), 'synthetic', 'generated', 'authentic')
@@ -45,7 +70,7 @@ class SyntheticDataGenerator:
             dob = self.faker.date_of_birth(minimum_age=18, maximum_age=65)
             country = self.faker.country()[:10].upper()
             date_of_issue = self.faker.date_between(start_date='-10y', end_date='today')
-            date_of_expiry = date_of_issue.replace(year=date_of_issue.year + 10)
+            date_of_expiry = add_years_safe(date_of_issue, 10)
             yy = date_of_issue.strftime('%y')
             rr = f"{random.randint(1, 99):02d}"
             ssss = f"{random.randint(1, 9999):04d}"
@@ -173,6 +198,7 @@ class SyntheticDataGenerator:
                 # Deterministically cycle through authentic cards
                 authentic_card_filename = get_next_authentic_card()
                 authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+                source_id = os.path.splitext(authentic_card_filename)[0]
                 
                 # Open the authentic ID card
                 id_card = Image.open(authentic_card_path).convert("RGB")
@@ -194,7 +220,7 @@ class SyntheticDataGenerator:
                 id_card.paste(compressed_face, TEMPLATE_COORDINATES['photo'])
                 
                 # Save the forged ID card
-                forged_filename = f"class1_{i+1:04d}.jpg"
+                forged_filename = f"class1_{i+1:04d}__src__{source_id}.jpg"
                 output_path = os.path.join(self.forged_dir, forged_filename)
                 id_card.save(output_path, "JPEG", quality=90)
                 
@@ -214,6 +240,7 @@ class SyntheticDataGenerator:
         class_2_count = class_counts.get(2, 0)
         if class_2_count > 0:
             print(f"Generating {class_2_count} Class 2 forged ID cards (Name Alteration)...")
+            clean_template = Image.open(self.template_path).convert("RGB")
             
             for i in range(class_2_count):
                 # Deterministically cycle through authentic cards
@@ -239,15 +266,21 @@ class SyntheticDataGenerator:
                 name_height = test_bbox[3] - test_bbox[1]
                 
                 # Define padding around the name for the erase patch
-                padding = 10
+                padding = self.artifact_cfg['name_patch_padding']
                 erase_box = (name_x - padding, name_y - padding, name_x + name_width + padding, name_y + name_height + padding)
-                
-                # Open the pristine blank template to steal a matching background patch
-                clean_template = Image.open(self.template_path).convert("RGB")
                 
                 # Extract the exact matching background from the clean template
                 erase_box_int = (int(erase_box[0]), int(erase_box[1]), int(erase_box[2]), int(erase_box[3]))
                 texture_patch = clean_template.crop(erase_box_int)
+
+                # Add subtle local tampering artifacts for learnable ELA signals
+                patch_buffer = BytesIO()
+                texture_patch.save(patch_buffer, "JPEG", quality=self.artifact_cfg['patch_jpeg_quality'])
+                patch_buffer.seek(0)
+                texture_patch = Image.open(patch_buffer).convert("RGB")
+                enhancer = ImageEnhance.Brightness(texture_patch)
+                min_brightness, max_brightness = self.artifact_cfg['patch_brightness_range']
+                texture_patch = enhancer.enhance(random.uniform(min_brightness, max_brightness))
                 
                 # Paste the perfect texture patch over the original name to erase it
                 id_card.paste(texture_patch, erase_box_int)
@@ -257,14 +290,15 @@ class SyntheticDataGenerator:
                 
                 # Draw the new name with a slight Y shift (simulate human misalignment)
                 draw = ImageDraw.Draw(id_card)
-                new_name_y = name_y + 2  # Shift Y by 2 pixels
+                min_name_jitter, max_name_jitter = self.artifact_cfg['name_y_jitter_range']
+                new_name_y = name_y + random.randint(min_name_jitter, max_name_jitter)
                 text_color = "#1a1a1a"
                 draw.text((name_x, new_name_y), new_name, font=self.font_main, fill=text_color)
                 
                 # Save the forged ID card
-                forged_filename = f"class2_{i+1:04d}.jpg"
+                forged_filename = f"class2_{i+1:04d}__src__{citizen_id}.jpg"
                 output_path = os.path.join(self.forged_dir, forged_filename)
-                id_card.save(output_path, "JPEG", quality=90)
+                id_card.save(output_path, "JPEG", quality=self.artifact_cfg['forged_jpeg_quality'])
                 
                 # Create a binary mask showing the forged region (white = forged, black = authentic)
                 mask = Image.new("L", id_card.size, 0)  # Black background
@@ -290,11 +324,13 @@ class SyntheticDataGenerator:
         class_4_count = class_counts.get(4, 0)
         if class_4_count > 0:
             print(f"Generating {class_4_count} Class 4 forged ID cards (Region Overlay)...")
+            clean_template = Image.open(self.template_path).convert("RGB")
             
             for i in range(class_4_count):
                 # Deterministically cycle through authentic cards
                 authentic_card_filename = get_next_authentic_card()
                 authentic_card_path = os.path.join(self.authentic_dir, authentic_card_filename)
+                source_id = os.path.splitext(authentic_card_filename)[0]
                 
                 # Open the authentic ID card
                 id_card = Image.open(authentic_card_path).convert("RGB")
@@ -309,27 +345,37 @@ class SyntheticDataGenerator:
                 expiry_height = test_bbox[3] - test_bbox[1]
                 
                 # Define padded bounding box to cover the entire area (including guilloche)
-                padding = 15
+                padding = self.artifact_cfg['expiry_patch_padding']
                 overlay_box = (int(expiry_x - padding), int(expiry_y - padding), 
                               int(expiry_x + expiry_width + padding), int(expiry_y + expiry_height + padding))
                 
-                # Draw a solid white rectangle over the date of expiry area
+                # Replace with a matching template patch, then add subtle local artifacts
                 draw = ImageDraw.Draw(id_card)
-                draw.rectangle(overlay_box, fill=(255, 255, 255))
+                texture_patch = clean_template.crop(overlay_box)
+                patch_buffer = BytesIO()
+                texture_patch.save(patch_buffer, "JPEG", quality=self.artifact_cfg['patch_jpeg_quality'])
+                patch_buffer.seek(0)
+                texture_patch = Image.open(patch_buffer).convert("RGB")
+                enhancer = ImageEnhance.Brightness(texture_patch)
+                min_brightness, max_brightness = self.artifact_cfg['patch_brightness_range']
+                texture_patch = enhancer.enhance(random.uniform(min_brightness, max_brightness))
+                id_card.paste(texture_patch, overlay_box)
                 
                 # Generate a fake date of expiry
                 fake_issue_date = self.faker.date_between(start_date='-10y', end_date='today')
-                fake_expiry_date = fake_issue_date.replace(year=fake_issue_date.year + 10)
+                fake_expiry_date = add_years_safe(fake_issue_date, 10)
                 fake_expiry_str = fake_expiry_date.strftime('%d %b %Y').upper()
                 
                 # Draw the new date on top of the white rectangle
                 text_color = "#1a1a1a"
-                draw.text((expiry_x, expiry_y), fake_expiry_str, font=self.font_main, fill=text_color)
+                min_expiry_jitter, max_expiry_jitter = self.artifact_cfg['expiry_y_jitter_range']
+                fake_expiry_y = expiry_y + random.randint(min_expiry_jitter, max_expiry_jitter)
+                draw.text((expiry_x, fake_expiry_y), fake_expiry_str, font=self.font_main, fill=text_color)
                 
                 # Save the forged ID card
-                forged_filename = f"class4_{i+1:04d}.jpg"
+                forged_filename = f"class4_{i+1:04d}__src__{source_id}.jpg"
                 output_path = os.path.join(self.forged_dir, forged_filename)
-                id_card.save(output_path, "JPEG", quality=90)
+                id_card.save(output_path, "JPEG", quality=self.artifact_cfg['forged_jpeg_quality'])
                 
                 # Create a binary mask showing the forged region (white = forged, black = authentic)
                 mask = Image.new("L", id_card.size, 0)  # Black background
