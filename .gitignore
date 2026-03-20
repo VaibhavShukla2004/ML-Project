@@ -5,3 +5,4 @@ data/fonts
 __pycache__/
 *.pyc
 TODO.md
+results/*.pth

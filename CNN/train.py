@@ -1,13 +1,17 @@
 import os
 import json
 import random
+import argparse
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
+import torch.profiler
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from sklearn.metrics import classification_report, confusion_matrix
 import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
+import torch.nn.functional as F
 
 try:
     from model import build_model
@@ -21,14 +25,101 @@ LABEL_NAMES = ['authentic', 'class1_photo', 'class2_name', 'class4_overlay']
 CLASS_LABEL_IDS = list(range(len(LABEL_NAMES)))
 
 
-def set_global_seed(seed):
+class FocalLoss(nn.Module):
+    """Multi-class focal loss with optional per-class alpha weighting."""
+
+    def __init__(self, gamma=2.0, alpha=None, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)
+        probs = log_probs.exp()
+
+        target_log_probs = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        target_probs = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+
+        focal_factor = (1.0 - target_probs).pow(self.gamma)
+        loss = -focal_factor * target_log_probs
+
+        if self.alpha is not None:
+            alpha_t = self.alpha.gather(0, targets)
+            loss = alpha_t * loss
+
+        if self.reduction == 'mean':
+            return loss.mean()
+        if self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+
+def set_global_seed(seed, deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+
+def configure_gpu_runtime(device, deterministic=False, allow_tf32=True, matmul_precision='high'):
+    if device.type == 'cuda':
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+
+    if hasattr(torch, 'set_float32_matmul_precision'):
+        torch.set_float32_matmul_precision(matmul_precision)
+
+    torch.backends.cudnn.deterministic = deterministic
+    torch.backends.cudnn.benchmark = not deterministic
+
+
+def get_amp_dtype(amp_dtype):
+    if amp_dtype == 'bfloat16':
+        return torch.bfloat16
+    return torch.float16
+
+
+def build_arg_parser():
+    parser = argparse.ArgumentParser(description='Train document forgery CNN with optional L4 GPU optimizations.')
+    parser.add_argument('--authentic-dir', default='synthetic/generated/authentic')
+    parser.add_argument('--forged-dir', default='synthetic/generated/forged')
+    parser.add_argument(
+        '--target-size', type=int, nargs=2, default=[800, 600],
+        metavar=('HEIGHT', 'WIDTH'),
+        help='Resize target (H W) for full-card input. Default: 800 600 (L4-optimised).',
+    )
+    parser.add_argument('--batch-size', type=int, default=64)
+    parser.add_argument('--num-workers', type=int, default=min(8, max(2, (os.cpu_count() or 2) // 2)))
+    parser.add_argument('--train-augmentation', choices=['full', 'light', 'none'], default='full', help='CPU-side train augmentation intensity.')
+    parser.add_argument('--use-ela', action='store_true', help='Append ELA as a 4th input channel (RGB+ELA).')
+    parser.add_argument('--ela-quality', type=int, default=90, help='JPEG quality used when computing ELA channel.')
+    parser.add_argument('--ela-scale', type=float, default=12.0, help='Intensity scaling factor for ELA channel.')
+    parser.add_argument('--prefetch-factor', type=int, default=4, help='DataLoader prefetch factor (effective when num_workers > 0).')
+    parser.add_argument('--no-persistent-workers', action='store_true', help='Disable DataLoader persistent workers.')
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--resume', action='store_true', help='Resume phase checkpoint if available.')
+    parser.add_argument('--early-stopping-patience', type=int, default=5)
+    parser.add_argument('--phase1-epochs', type=int, default=10)
+    parser.add_argument('--phase2-epochs', type=int, default=20)
+    parser.add_argument('--phase1-lr', type=float, default=1e-3)
+    parser.add_argument('--phase2-lr', type=float, default=1e-5)
+    parser.add_argument('--loss-type', choices=['focal', 'ce'], default='focal', help='Loss function to optimize.')
+    parser.add_argument('--focal-gamma', type=float, default=2.0, help='Gamma for focal loss hard-example focusing.')
+    parser.add_argument('--grad-accum-steps', type=int, default=1, help='Gradient accumulation steps (effective batch = batch_size * grad_accum_steps).')
+    parser.add_argument('--phase1-stem-trainable', action='store_true', help='Keep stem trainable in Phase 1 (higher VRAM, useful for ELA adaptation).')
+    parser.add_argument('--disable-phase1-backbone-no-grad', action='store_true', help='Disable Phase-1 memory-saving no-grad backbone path.')
+    parser.add_argument('--use-amp', action='store_true', help='Enable mixed precision training on CUDA.')
+    parser.add_argument('--amp-dtype', choices=['float16', 'bfloat16'], default='float16')
+    parser.add_argument('--channels-last', action='store_true', help='Use channels-last memory format on CUDA.')
+    parser.add_argument('--no-compile', action='store_true', help='Disable torch.compile to reduce compile/runtime overhead and instability.')
+    parser.add_argument('--deterministic', action='store_true', help='Enable deterministic mode (slower, reproducible).')
+    parser.add_argument('--disable-tf32', action='store_true', help='Disable TF32 acceleration on supported NVIDIA GPUs.')
+    parser.add_argument('--profile', action='store_true', help='Profile first epoch (5 batches) with torch.profiler; outputs to ./profiler_logs.')
+    return parser
 
 
 def save_json(path, payload):
@@ -37,7 +128,20 @@ def save_json(path, payload):
 
 
 # ─── Core training function for one epoch ────────────────────────────────────
-def train_one_epoch(model, loader, criterion, optimizer, device):
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    device,
+    use_amp=False,
+    amp_dtype=torch.float16,
+    scaler=None,
+    use_channels_last=False,
+    enable_profiler=False,
+    grad_accum_steps=1,
+    forward_fn=None,
+):
     if len(loader) == 0:
         raise ValueError("train_loader is empty. Check split ratios and dataset generation.")
 
@@ -45,18 +149,61 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
     running_loss = 0.0
     correct = 0
     total = 0
+    batches_processed = 0
+    autocast_ctx = (
+        torch.autocast(device_type='cuda', dtype=amp_dtype)
+        if use_amp and device.type == 'cuda'
+        else nullcontext()
+    )
+
+    profiler_ctx = None
+    if enable_profiler and device.type == 'cuda':
+        os.makedirs('profiler_logs', exist_ok=True)
+        profiler_ctx = torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler('./profiler_logs'),
+            acc_events=True,
+            record_shapes=True,
+            with_stack=True,
+        )
+        profiler_ctx.__enter__()
+
+    optimizer.zero_grad(set_to_none=True)
 
     for batch_idx, (images, labels) in enumerate(loader):
-        images = images.to(device)
-        labels = labels.to(device)
+        batches_processed += 1
+        images = images.to(device, non_blocking=(device.type == 'cuda'))
+        if use_channels_last and device.type == 'cuda':
+            images = images.contiguous(memory_format=torch.channels_last)
+        labels = labels.to(device, non_blocking=(device.type == 'cuda'))
 
-        optimizer.zero_grad()           # Clear gradients from previous batch
-        outputs = model(images)         # Forward pass
-        loss = criterion(outputs, labels)
-        loss.backward()                 # Backpropagation
-        optimizer.step()                # Update weights
+        with autocast_ctx:
+            outputs = forward_fn(images) if forward_fn is not None else model(images)
+            raw_loss = criterion(outputs, labels)
+            loss = raw_loss / grad_accum_steps
 
-        running_loss += loss.item()
+        if scaler is not None and scaler.is_enabled():
+            scaler.scale(loss).backward()   # Backpropagation
+        else:
+            loss.backward()                 # Backpropagation
+
+        should_step = ((batch_idx + 1) % grad_accum_steps == 0) or ((batch_idx + 1) == len(loader))
+        if should_step:
+            if scaler is not None and scaler.is_enabled():
+                scaler.step(optimizer)          # Update weights
+                scaler.update()
+            else:
+                optimizer.step()                # Update weights
+            optimizer.zero_grad(set_to_none=True)
+
+        if enable_profiler and profiler_ctx is not None:
+            profiler_ctx.step()
+
+        running_loss += raw_loss.item()
         _, predicted = outputs.max(1)   # Take the class with highest logit
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
@@ -67,13 +214,22 @@ def train_one_epoch(model, loader, criterion, optimizer, device):
                   f"| Loss: {running_loss / (batch_idx + 1):.4f} "
                   f"| Acc: {100. * correct / total:.1f}%")
 
-    epoch_loss = running_loss / len(loader)
+        # Exit early during profiling after sampling ~5 batches
+        if enable_profiler and batch_idx >= 5:
+            print("Profiling complete. Exiting training snapshot.")
+            break
+
+    epoch_loss = running_loss / batches_processed
     epoch_acc = 100. * correct / total
+    
+    if enable_profiler and profiler_ctx is not None:
+        profiler_ctx.__exit__(None, None, None)
+
     return epoch_loss, epoch_acc
 
 
 # ─── Validation / evaluation function ────────────────────────────────────────
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, use_amp=False, amp_dtype=torch.float16, use_channels_last=False):
     if len(loader) == 0:
         raise ValueError("evaluation loader is empty. Check split ratios and dataset generation.")
 
@@ -83,14 +239,22 @@ def evaluate(model, loader, criterion, device):
     total = 0
     all_preds = []
     all_labels = []
+    autocast_ctx = (
+        torch.autocast(device_type='cuda', dtype=amp_dtype)
+        if use_amp and device.type == 'cuda'
+        else nullcontext()
+    )
 
     with torch.no_grad():   # No gradient computation needed for evaluation
         for images, labels in loader:
-            images = images.to(device)
-            labels = labels.to(device)
+            images = images.to(device, non_blocking=(device.type == 'cuda'))
+            if use_channels_last and device.type == 'cuda':
+                images = images.contiguous(memory_format=torch.channels_last)
+            labels = labels.to(device, non_blocking=(device.type == 'cuda'))
 
-            outputs = model(images)
-            loss = criterion(outputs, labels)
+            with autocast_ctx:
+                outputs = model(images)
+                loss = criterion(outputs, labels)
 
             running_loss += loss.item()
             _, predicted = outputs.max(1)
@@ -133,6 +297,13 @@ def run_phase(
     scheduler,
     device,
     num_epochs,
+    use_amp=False,
+    amp_dtype=torch.float16,
+    scaler=None,
+    use_channels_last=False,
+    enable_profiler=False,
+    grad_accum_steps=1,
+    forward_fn=None,
     early_stopping_patience=5,
     resume=False,
     save_dir='results'
@@ -168,11 +339,30 @@ def run_phase(
         print(f"\n[{phase_name}] Epoch {epoch}/{num_epochs}")
         print("-" * 50)
 
+        profile_this_epoch = enable_profiler and epoch == start_epoch
+
         train_loss, train_acc = train_one_epoch(
-            model, train_loader, criterion, optimizer, device
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            scaler=scaler,
+            use_channels_last=use_channels_last,
+            enable_profiler=profile_this_epoch,
+            grad_accum_steps=grad_accum_steps,
+            forward_fn=forward_fn,
         )
         val_loss, val_acc, val_preds, val_labels = evaluate(
-            model, val_loader, criterion, device
+            model,
+            val_loader,
+            criterion,
+            device,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+            use_channels_last=use_channels_last,
         )
 
         # Step the scheduler based on validation loss
@@ -249,21 +439,26 @@ def run_phase(
 
 # ─── Main entry point ─────────────────────────────────────────────────────────
 def main():
-    seed = 42
-    set_global_seed(seed)
-    # Set to False when changing model architecture or dataset.
-    # Keep True only for strict same-run continuation compatibility.
-    resume_training = False
-    early_stopping_patience = 5
+    args = build_arg_parser().parse_args()
+    seed = args.seed
+    set_global_seed(seed, deterministic=args.deterministic)
 
     # ── Build data pipeline ──────────────────────────────────────────────────
     print("Building data pipeline...")
     pipeline = build_pipeline(
-        authentic_dir='synthetic/generated/authentic',
-        forged_dir='synthetic/generated/forged',
-        batch_size=32,
-        num_workers=0,
+        authentic_dir=args.authentic_dir,
+        forged_dir=args.forged_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
         seed=seed,
+        target_size=tuple(args.target_size),
+        train_augmentation=args.train_augmentation,
+        persistent_workers=not args.no_persistent_workers,
+        prefetch_factor=args.prefetch_factor,
+        use_ela=args.use_ela,
+        ela_quality=args.ela_quality,
+        ela_scale=args.ela_scale,
     )
     train_loader = pipeline['train_loader']
     val_loader   = pipeline['val_loader']
@@ -272,24 +467,92 @@ def main():
 
     # ── Build model ──────────────────────────────────────────────────────────
     print("\nBuilding model...")
-    model, device = build_model(num_classes=4, dropout_rate=0.3)
+    model, device = build_model(
+        num_classes=4,
+        dropout_rate=0.3,
+        in_channels=pipeline['in_channels'],
+    )
+    configure_gpu_runtime(
+        device=device,
+        deterministic=args.deterministic,
+        allow_tf32=not args.disable_tf32,
+        matmul_precision='high',
+    )
+
+    amp_enabled = args.use_amp and device.type == 'cuda'
+    amp_dtype = get_amp_dtype(args.amp_dtype)
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled) if device.type == 'cuda' else None
+
+    if args.channels_last and device.type == 'cuda':
+        model = model.to(memory_format=torch.channels_last)
+
+    # JIT-compile model for ~15-30% speedup on CUDA (compilation overhead on first epoch)
+    if device.type == 'cuda' and not args.no_compile:
+        try:
+            model = torch.compile(model, mode='reduce-overhead')
+            compile_enabled = True
+        except Exception as e:
+            print(f"Warning: torch.compile failed ({e}), continuing without compilation.")
+            compile_enabled = False
+    else:
+        compile_enabled = False
+
+    print(
+        f"Runtime config | device={device} | amp={amp_enabled} ({args.amp_dtype}) "
+        f"| channels_last={args.channels_last and device.type == 'cuda'} "
+        f"| tf32={not args.disable_tf32 and device.type == 'cuda'} "
+        f"| torch.compile={compile_enabled} "
+        f"| train_aug={args.train_augmentation} "
+        f"| use_ela={args.use_ela} "
+        f"| ela_quality={args.ela_quality} "
+        f"| ela_scale={args.ela_scale} "
+        f"| grad_accum_steps={args.grad_accum_steps} "
+        f"| persistent_workers={not args.no_persistent_workers} "
+        f"| prefetch_factor={args.prefetch_factor} "
+        f"| workers={args.num_workers} | batch_size={args.batch_size}"
+    )
+
     class_weights = class_weights.to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    if args.loss_type == 'focal':
+        criterion = FocalLoss(gamma=args.focal_gamma, alpha=class_weights, reduction='mean')
+    else:
+        criterion = nn.CrossEntropyLoss(weight=class_weights)
+
+    print(f"Loss config | type={args.loss_type} | focal_gamma={args.focal_gamma if args.loss_type == 'focal' else 'n/a'}")
+
+    phase1_keep_stem_trainable = args.phase1_stem_trainable
+    phase1_backbone_no_grad = (not phase1_keep_stem_trainable) and (not args.disable_phase1_backbone_no_grad)
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE 1: Train classifier head only — backbone frozen
-    # Goal: Get the head to a reasonable state before touching backbone weights
+    # PHASE 1: Train classifier head with frozen backbone.
+    # When RGB+ELA is enabled, also keep the stem trainable so the new channel
+    # is integrated before full-network fine-tuning.
     # ════════════════════════════════════════════════════════════════════════
     print("\n" + "="*60)
-    print("PHASE 1: Training classifier head (backbone frozen)")
+    if phase1_keep_stem_trainable:
+        print("PHASE 1: Training classifier head + stem")
+    elif phase1_backbone_no_grad:
+        print("PHASE 1: Training classifier head (frozen backbone in no-grad mode)")
+    else:
+        print("PHASE 1: Training classifier head (backbone frozen)")
     print("="*60)
 
-    model.freeze_backbone()
+    model.freeze_backbone(keep_stem_trainable=phase1_keep_stem_trainable)
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(
+        f"Phase 1 trainable parameters: {trainable:,} / {total:,} "
+        f"| stem_trainable={phase1_keep_stem_trainable} "
+        f"| backbone_no_grad={phase1_backbone_no_grad}"
+    )
+
+    phase1_forward_fn = model.forward_head_with_frozen_features if phase1_backbone_no_grad else None
 
     # Higher LR is safe here — only the small head is being updated
     optimizer_p1 = torch.optim.Adam(
         filter(lambda p: p.requires_grad, model.parameters()),
-        lr=1e-3
+        lr=args.phase1_lr
     )
     scheduler_p1 = ReduceLROnPlateau(
         optimizer_p1, mode='min', factor=0.5, patience=3
@@ -304,9 +567,16 @@ def main():
         optimizer=optimizer_p1,
         scheduler=scheduler_p1,
         device=device,
-        num_epochs=10,
-        early_stopping_patience=early_stopping_patience,
-        resume=resume_training,
+        num_epochs=args.phase1_epochs,
+        use_amp=amp_enabled,
+        amp_dtype=amp_dtype,
+        scaler=scaler,
+        use_channels_last=args.channels_last,
+        enable_profiler=args.profile,
+        grad_accum_steps=args.grad_accum_steps,
+        forward_fn=phase1_forward_fn,
+        early_stopping_patience=args.early_stopping_patience,
+        resume=args.resume,
     )
 
     # Load best Phase 1 weights before starting Phase 2
@@ -331,7 +601,7 @@ def main():
     # Much lower LR — backbone weights are precious, nudge don't shove
     optimizer_p2 = torch.optim.Adam(
         model.parameters(),
-        lr=1e-5
+        lr=args.phase2_lr
     )
     scheduler_p2 = ReduceLROnPlateau(
         optimizer_p2, mode='min', factor=0.5, patience=3
@@ -346,9 +616,16 @@ def main():
         optimizer=optimizer_p2,
         scheduler=scheduler_p2,
         device=device,
-        num_epochs=20,
-        early_stopping_patience=early_stopping_patience,
-        resume=resume_training,
+        num_epochs=args.phase2_epochs,
+        use_amp=amp_enabled,
+        amp_dtype=amp_dtype,
+        scaler=scaler,
+        use_channels_last=args.channels_last,
+        enable_profiler=False,
+        grad_accum_steps=args.grad_accum_steps,
+        forward_fn=None,
+        early_stopping_patience=args.early_stopping_patience,
+        resume=args.resume,
     )
 
     # ════════════════════════════════════════════════════════════════════════
@@ -365,7 +642,13 @@ def main():
     model.load_state_dict(best_model_checkpoint['model_state_dict'])
 
     test_loss, test_acc, test_preds, test_labels = evaluate(
-        model, test_loader, criterion, device
+        model,
+        test_loader,
+        criterion,
+        device,
+        use_amp=amp_enabled,
+        amp_dtype=amp_dtype,
+        use_channels_last=args.channels_last,
     )
 
     print(f"Test Loss: {test_loss:.4f} | Test Accuracy: {test_acc:.1f}%")

@@ -1,10 +1,12 @@
 from collections import Counter
 from pathlib import Path
 import random
+from io import BytesIO
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
+from PIL import Image, ImageChops
 
 try:
     from dataset import DocumentDataset, LABEL_MAP
@@ -12,27 +14,106 @@ except ImportError:
     from CNN.dataset import DocumentDataset, LABEL_MAP
 
 
-train_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.RandomRotation(degrees=3),
-    transforms.RandomHorizontalFlip(p=0.3),
-    transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
-    transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
-])
+# Default target size tuned for the L4 GPU (24 GB VRAM): full card at high resolution
+# preserves guilloche patterns and typography artifacts engineered during data generation.
+DEFAULT_TARGET_SIZE = (800, 600)
 
-val_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(
-        mean=[0.485, 0.456, 0.406],
-        std=[0.229, 0.224, 0.225],
-    ),
-])
+RGB_MEAN = [0.485, 0.456, 0.406]
+RGB_STD = [0.229, 0.224, 0.225]
+ELA_MEAN = 0.5
+ELA_STD = 0.25
+
+
+def _compute_ela_channel(image, ela_quality=90, ela_scale=12.0):
+    """Compute a single-channel ELA map from a PIL RGB image."""
+    buffer = BytesIO()
+    image.save(buffer, format='JPEG', quality=ela_quality)
+    buffer.seek(0)
+    recompressed_pil = Image.open(buffer).convert('RGB')
+    ela = ImageChops.difference(image, recompressed_pil).convert('L')
+    ela = ela.point(lambda p: min(255, int(p * ela_scale)))
+    return transforms.functional.to_tensor(ela)
+
+
+def _to_model_tensor(image, use_ela=False, ela_quality=90, ela_scale=12.0):
+    """Convert PIL image to normalized RGB tensor, optionally appending ELA channel."""
+    rgb = transforms.functional.to_tensor(image)
+    if not use_ela:
+        return transforms.functional.normalize(rgb, mean=RGB_MEAN, std=RGB_STD)
+
+    ela = _compute_ela_channel(image, ela_quality=ela_quality, ela_scale=ela_scale)
+    stacked = torch.cat([rgb, ela], dim=0)
+    return transforms.functional.normalize(
+        stacked,
+        mean=RGB_MEAN + [ELA_MEAN],
+        std=RGB_STD + [ELA_STD],
+    )
+
+
+def make_train_transform(target_size=DEFAULT_TARGET_SIZE, use_ela=False, ela_quality=90, ela_scale=12.0):
+    return make_train_transform_with_profile(
+        target_size=target_size,
+        train_augmentation='full',
+        use_ela=use_ela,
+        ela_quality=ela_quality,
+        ela_scale=ela_scale,
+    )
+
+
+def make_train_transform_with_profile(
+    target_size=DEFAULT_TARGET_SIZE,
+    train_augmentation='full',
+    use_ela=False,
+    ela_quality=90,
+    ela_scale=12.0,
+):
+    if train_augmentation not in {'full', 'light', 'none'}:
+        raise ValueError("train_augmentation must be one of: full, light, none")
+
+    tensorize = transforms.Lambda(
+        lambda img: _to_model_tensor(
+            img,
+            use_ela=use_ela,
+            ela_quality=ela_quality,
+            ela_scale=ela_scale,
+        )
+    )
+
+    if train_augmentation == 'none':
+        return transforms.Compose([
+            transforms.Resize(target_size),
+            tensorize,
+        ])
+
+    if train_augmentation == 'light':
+        return transforms.Compose([
+            transforms.Resize(target_size),
+            transforms.RandomHorizontalFlip(p=0.2),
+            tensorize,
+        ])
+
+    return transforms.Compose([
+        transforms.Resize(target_size),
+        transforms.RandomRotation(degrees=3),
+        transforms.RandomHorizontalFlip(p=0.3),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+        transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+        tensorize,
+    ])
+
+
+def make_eval_transform(target_size=DEFAULT_TARGET_SIZE, use_ela=False, ela_quality=90, ela_scale=12.0):
+    return transforms.Compose([
+        transforms.Resize(target_size),
+        transforms.Lambda(
+            lambda img: _to_model_tensor(
+                img,
+                use_ela=use_ela,
+                ela_quality=ela_quality,
+                ela_scale=ela_scale,
+            )
+        ),
+    ])
 
 
 class TransformSubset(Dataset):
@@ -107,6 +188,11 @@ def build_splits(
     train_ratio=0.70,
     val_ratio=0.15,
     seed=42,
+    target_size=DEFAULT_TARGET_SIZE,
+    train_augmentation='full',
+    use_ela=False,
+    ela_quality=90,
+    ela_scale=12.0,
 ):
     full_dataset = DocumentDataset(
         authentic_dir=authentic_dir,
@@ -129,9 +215,34 @@ def build_splits(
     val_subset = Subset(full_dataset, val_indices)
     test_subset = Subset(full_dataset, test_indices)
 
-    train_set = TransformSubset(train_subset, train_transform)
-    val_set = TransformSubset(val_subset, val_transform)
-    test_set = TransformSubset(test_subset, val_transform)
+    train_set = TransformSubset(
+        train_subset,
+        make_train_transform_with_profile(
+            target_size=target_size,
+            train_augmentation=train_augmentation,
+            use_ela=use_ela,
+            ela_quality=ela_quality,
+            ela_scale=ela_scale,
+        ),
+    )
+    val_set = TransformSubset(
+        val_subset,
+        make_eval_transform(
+            target_size=target_size,
+            use_ela=use_ela,
+            ela_quality=ela_quality,
+            ela_scale=ela_scale,
+        ),
+    )
+    test_set = TransformSubset(
+        test_subset,
+        make_eval_transform(
+            target_size=target_size,
+            use_ela=use_ela,
+            ela_quality=ela_quality,
+            ela_scale=ela_scale,
+        ),
+    )
 
     return full_dataset, train_set, val_set, test_set
 
@@ -143,32 +254,37 @@ def build_dataloaders(
     batch_size=32,
     num_workers=0,
     pin_memory=None,
+    persistent_workers=True,
+    prefetch_factor=4,
 ):
     if pin_memory is None:
         pin_memory = torch.cuda.is_available()
 
+    loader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs['persistent_workers'] = persistent_workers
+        loader_kwargs['prefetch_factor'] = prefetch_factor
+
     train_loader = DataLoader(
         train_set,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
 
     val_loader = DataLoader(
         val_set,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
 
     test_loader = DataLoader(
         test_set,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
+        **loader_kwargs,
     )
 
     return train_loader, val_loader, test_loader
@@ -234,11 +350,23 @@ def build_pipeline(
     num_workers=0,
     pin_memory=None,
     seed=42,
+    target_size=DEFAULT_TARGET_SIZE,
+    train_augmentation='full',
+    persistent_workers=True,
+    prefetch_factor=4,
+    use_ela=False,
+    ela_quality=90,
+    ela_scale=12.0,
 ):
     full_dataset, train_set, val_set, test_set = build_splits(
         authentic_dir=authentic_dir,
         forged_dir=forged_dir,
         seed=seed,
+        target_size=target_size,
+        train_augmentation=train_augmentation,
+        use_ela=use_ela,
+        ela_quality=ela_quality,
+        ela_scale=ela_scale,
     )
     train_loader, val_loader, test_loader = build_dataloaders(
         train_set=train_set,
@@ -247,6 +375,8 @@ def build_pipeline(
         batch_size=batch_size,
         num_workers=num_workers,
         pin_memory=pin_memory,
+        persistent_workers=persistent_workers,
+        prefetch_factor=prefetch_factor,
     )
 
     return {
@@ -258,6 +388,7 @@ def build_pipeline(
         "val_loader": val_loader,
         "test_loader": test_loader,
         "class_weights": compute_class_weights(train_set),
+        "in_channels": 4 if use_ela else 3,
     }
 
 
