@@ -1,0 +1,19 @@
+Classification Report
+                precision    recall  f1-score   support
+
+     authentic       0.56      0.56      0.56        16
+  class1_photo       0.33      0.38      0.35         8
+   class2_name       0.40      0.50      0.44         4
+class4_overlay       1.00      0.50      0.67         4
+
+      accuracy                           0.50        32
+     macro avg       0.57      0.48      0.51        32
+  weighted avg       0.54      0.50      0.51        32
+
+
+Confusion Matrix (rows=true, cols=predicted)
+Labels: authentic, class1_photo, class2_name, class4_overlay
+[[9 4 3 0]
+ [5 3 0 0]
+ [1 1 2 0]
+ [1 1 0 2]]

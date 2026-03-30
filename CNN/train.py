@@ -12,17 +12,23 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 import torch.nn.functional as F
+from torch.utils.data import Subset
 
 try:
-    from model import build_model
+    from model import REGION_HEAD_NAMES, build_model
     from data_pipeline import build_pipeline
 except ImportError:
-    from CNN.model import build_model
+    from CNN.model import REGION_HEAD_NAMES, build_model
     from CNN.data_pipeline import build_pipeline
 
 # ─── Label names for reporting ───────────────────────────────────────────────
 LABEL_NAMES = ['authentic', 'class1_photo', 'class2_name', 'class4_overlay']
 CLASS_LABEL_IDS = list(range(len(LABEL_NAMES)))
+AUX_HEAD_LABEL_IDS = {
+    'photo': 1,
+    'name': 2,
+    'expiry': 3,
+}
 
 
 class FocalLoss(nn.Module):
@@ -53,6 +59,79 @@ class FocalLoss(nn.Module):
         if self.reduction == 'sum':
             return loss.sum()
         return loss
+
+
+def _extract_labels_from_dataset(dataset):
+    if hasattr(dataset, 'subset') and isinstance(dataset.subset, Subset):
+        base_dataset = dataset.subset.dataset
+        indices = dataset.subset.indices
+        base_samples = getattr(base_dataset, 'samples', None)
+        if base_samples is None:
+            raise TypeError("Expected base dataset to expose a 'samples' attribute.")
+        return [base_samples[i][1] for i in indices]
+
+    if isinstance(dataset, Subset):
+        base_dataset = dataset.dataset
+        indices = dataset.indices
+        base_samples = getattr(base_dataset, 'samples', None)
+        if base_samples is None:
+            raise TypeError("Expected base dataset to expose a 'samples' attribute.")
+        return [base_samples[i][1] for i in indices]
+
+    samples = getattr(dataset, 'samples', None)
+    if samples is None:
+        raise TypeError("Expected dataset to expose a 'samples' attribute.")
+    return [label for _, label in samples]
+
+
+def build_aux_targets(labels):
+    return torch.stack(
+        [(labels == AUX_HEAD_LABEL_IDS[region_name]).float() for region_name in REGION_HEAD_NAMES],
+        dim=1,
+    )
+
+
+def get_fusion_logits(outputs):
+    if isinstance(outputs, dict):
+        return outputs['fusion_logits']
+    return outputs
+
+
+def get_predicted_classes(outputs):
+    return get_fusion_logits(outputs).argmax(dim=1)
+
+
+def compute_aux_pos_weight(dataset):
+    labels = _extract_labels_from_dataset(dataset)
+    total = len(labels)
+    pos_weights = []
+    for region_name in REGION_HEAD_NAMES:
+        positives = sum(label == AUX_HEAD_LABEL_IDS[region_name] for label in labels)
+        if positives == 0:
+            raise ValueError(
+                f"Training split is missing positives for auxiliary head '{region_name}'. "
+                "Adjust split/data generation before training."
+            )
+        negatives = total - positives
+        pos_weights.append(negatives / positives)
+    return torch.tensor(pos_weights, dtype=torch.float)
+
+
+class MultiHeadFusionLoss(nn.Module):
+    def __init__(self, class_loss, aux_loss_weight=0.35, aux_pos_weight=None):
+        super().__init__()
+        self.class_loss = class_loss
+        self.aux_loss_weight = aux_loss_weight
+        self.aux_loss = nn.BCEWithLogitsLoss(pos_weight=aux_pos_weight)
+
+    def forward(self, outputs, labels):
+        if not isinstance(outputs, dict) or 'fusion_logits' not in outputs or 'aux_logits' not in outputs:
+            raise TypeError("Expected model outputs to include 'fusion_logits' and 'aux_logits'.")
+
+        fusion_loss = self.class_loss(outputs['fusion_logits'], labels)
+        aux_targets = build_aux_targets(labels).to(device=outputs['aux_logits'].device, dtype=outputs['aux_logits'].dtype)
+        aux_loss = self.aux_loss(outputs['aux_logits'], aux_targets)
+        return fusion_loss + self.aux_loss_weight * aux_loss
 
 
 def set_global_seed(seed, deterministic=False):
@@ -94,8 +173,13 @@ def build_arg_parser():
     )
     parser.add_argument('--batch-size', type=int, default=64)
     parser.add_argument('--num-workers', type=int, default=min(8, max(2, (os.cpu_count() or 2) // 2)))
-    parser.add_argument('--train-augmentation', choices=['full', 'light', 'none'], default='full', help='CPU-side train augmentation intensity.')
+    parser.add_argument('--train-augmentation', choices=['full', 'light', 'none', 'adversarial'], default='full', help='CPU-side train augmentation intensity.')
+    parser.add_argument('--adversarial-seed', type=int, default=None, help='Seed for adversarial augmentation (None = per-worker random).')
+    parser.add_argument('--adversarial-prob', type=float, default=0.3, help='Probability of applying an adversarial recipe to a training image.')
+    parser.add_argument('--adversarial-jpeg-min-quality', type=int, default=40, help='Minimum JPEG quality used inside adversarial augmentation.')
+    parser.add_argument('--adversarial-jpeg-max-quality', type=int, default=60, help='Maximum JPEG quality used inside adversarial augmentation.')
     parser.add_argument('--use-ela', action='store_true', help='Append ELA as a 4th input channel (RGB+ELA).')
+    parser.add_argument('--use-coord-channels', action='store_true', help='Append X/Y coordinate channels so the CNN can learn absolute layout cues.')
     parser.add_argument('--ela-quality', type=int, default=90, help='JPEG quality used when computing ELA channel.')
     parser.add_argument('--ela-scale', type=float, default=12.0, help='Intensity scaling factor for ELA channel.')
     parser.add_argument('--prefetch-factor', type=int, default=4, help='DataLoader prefetch factor (effective when num_workers > 0).')
@@ -109,6 +193,7 @@ def build_arg_parser():
     parser.add_argument('--phase2-lr', type=float, default=1e-5)
     parser.add_argument('--loss-type', choices=['focal', 'ce'], default='focal', help='Loss function to optimize.')
     parser.add_argument('--focal-gamma', type=float, default=2.0, help='Gamma for focal loss hard-example focusing.')
+    parser.add_argument('--aux-loss-weight', type=float, default=0.35, help='Weight applied to the three regional auxiliary BCE heads.')
     parser.add_argument('--grad-accum-steps', type=int, default=1, help='Gradient accumulation steps (effective batch = batch_size * grad_accum_steps).')
     parser.add_argument('--phase1-stem-trainable', action='store_true', help='Keep stem trainable in Phase 1 (higher VRAM, useful for ELA adaptation).')
     parser.add_argument('--disable-phase1-backbone-no-grad', action='store_true', help='Disable Phase-1 memory-saving no-grad backbone path.')
@@ -125,6 +210,22 @@ def build_arg_parser():
 def save_json(path, payload):
     with open(path, 'w', encoding='utf-8') as fp:
         json.dump(payload, fp, indent=2)
+
+
+def build_checkpoint_config(args, pipeline):
+    return {
+        'model_name': 'roi_fusion_efficientnet_b0',
+        'label_names': LABEL_NAMES,
+        'target_size': list(args.target_size),
+        'use_ela': args.use_ela,
+        'use_coord_channels': args.use_coord_channels,
+        'ela_quality': args.ela_quality,
+        'ela_scale': args.ela_scale,
+        'adversarial_prob': args.adversarial_prob,
+        'adversarial_jpeg_min_quality': args.adversarial_jpeg_min_quality,
+        'adversarial_jpeg_max_quality': args.adversarial_jpeg_max_quality,
+        'in_channels': pipeline['in_channels'],
+    }
 
 
 # ─── Core training function for one epoch ────────────────────────────────────
@@ -204,7 +305,7 @@ def train_one_epoch(
             profiler_ctx.step()
 
         running_loss += raw_loss.item()
-        _, predicted = outputs.max(1)   # Take the class with highest logit
+        predicted = get_predicted_classes(outputs)
         total += labels.size(0)
         correct += predicted.eq(labels).sum().item()
 
@@ -257,7 +358,7 @@ def evaluate(model, loader, criterion, device, use_amp=False, amp_dtype=torch.fl
                 loss = criterion(outputs, labels)
 
             running_loss += loss.item()
-            _, predicted = outputs.max(1)
+            predicted = get_predicted_classes(outputs)
             total += labels.size(0)
             correct += predicted.eq(labels).sum().item()
 
@@ -306,6 +407,7 @@ def run_phase(
     forward_fn=None,
     early_stopping_patience=5,
     resume=False,
+    checkpoint_config=None,
     save_dir='results'
 ):
     os.makedirs(save_dir, exist_ok=True)
@@ -388,6 +490,7 @@ def run_phase(
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
+                'config': checkpoint_config,
                 'val_loss': val_loss,
                 'val_acc': val_acc,
                 'best_val_loss': best_val_loss,
@@ -402,6 +505,7 @@ def run_phase(
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
+            'config': checkpoint_config,
             'best_val_loss': best_val_loss,
             'history': history,
             'epochs_without_improvement': epochs_without_improvement,
@@ -459,11 +563,22 @@ def main():
         use_ela=args.use_ela,
         ela_quality=args.ela_quality,
         ela_scale=args.ela_scale,
+        use_coord_channels=args.use_coord_channels,
+        adversarial_seed=args.adversarial_seed,
+        adversarial_prob=args.adversarial_prob,
+        adversarial_jpeg_min_quality=args.adversarial_jpeg_min_quality,
+        adversarial_jpeg_max_quality=args.adversarial_jpeg_max_quality,
     )
     train_loader = pipeline['train_loader']
     val_loader   = pipeline['val_loader']
     test_loader  = pipeline['test_loader']
     class_weights = pipeline['class_weights']
+    aux_pos_weight = compute_aux_pos_weight(pipeline['train_set'])
+    checkpoint_config = build_checkpoint_config(args, pipeline)
+    save_json(
+        os.path.join('results', 'inference_config.json'),
+        checkpoint_config,
+    )
 
     # ── Build model ──────────────────────────────────────────────────────────
     print("\nBuilding model...")
@@ -499,13 +614,18 @@ def main():
 
     print(
         f"Runtime config | device={device} | amp={amp_enabled} ({args.amp_dtype}) "
+        f"| model=roi_fusion "
         f"| channels_last={args.channels_last and device.type == 'cuda'} "
         f"| tf32={not args.disable_tf32 and device.type == 'cuda'} "
         f"| torch.compile={compile_enabled} "
         f"| train_aug={args.train_augmentation} "
         f"| use_ela={args.use_ela} "
+        f"| use_coord_channels={args.use_coord_channels} "
         f"| ela_quality={args.ela_quality} "
         f"| ela_scale={args.ela_scale} "
+        f"| adversarial_prob={args.adversarial_prob} "
+        f"| adv_jpeg_q=[{args.adversarial_jpeg_min_quality},{args.adversarial_jpeg_max_quality}] "
+        f"| in_channels={pipeline['in_channels']} "
         f"| grad_accum_steps={args.grad_accum_steps} "
         f"| persistent_workers={not args.no_persistent_workers} "
         f"| prefetch_factor={args.prefetch_factor} "
@@ -513,28 +633,39 @@ def main():
     )
 
     class_weights = class_weights.to(device)
+    aux_pos_weight = aux_pos_weight.to(device)
     if args.loss_type == 'focal':
-        criterion = FocalLoss(gamma=args.focal_gamma, alpha=class_weights, reduction='mean')
+        class_criterion = FocalLoss(gamma=args.focal_gamma, alpha=class_weights, reduction='mean')
     else:
-        criterion = nn.CrossEntropyLoss(weight=class_weights)
+        class_criterion = nn.CrossEntropyLoss(weight=class_weights)
 
-    print(f"Loss config | type={args.loss_type} | focal_gamma={args.focal_gamma if args.loss_type == 'focal' else 'n/a'}")
+    criterion = MultiHeadFusionLoss(
+        class_loss=class_criterion,
+        aux_loss_weight=args.aux_loss_weight,
+        aux_pos_weight=aux_pos_weight,
+    )
+
+    print(
+        f"Loss config | type={args.loss_type} "
+        f"| focal_gamma={args.focal_gamma if args.loss_type == 'focal' else 'n/a'} "
+        f"| aux_loss_weight={args.aux_loss_weight}"
+    )
 
     phase1_keep_stem_trainable = args.phase1_stem_trainable
     phase1_backbone_no_grad = (not phase1_keep_stem_trainable) and (not args.disable_phase1_backbone_no_grad)
 
     # ════════════════════════════════════════════════════════════════════════
-    # PHASE 1: Train classifier head with frozen backbone.
-    # When RGB+ELA is enabled, also keep the stem trainable so the new channel
-    # is integrated before full-network fine-tuning.
+    # PHASE 1: Train fusion and auxiliary heads with frozen backbone.
+    # When extra non-RGB channels are enabled, keeping the stem trainable helps
+    # the first convolution adapt before full-network fine-tuning.
     # ════════════════════════════════════════════════════════════════════════
     print("\n" + "="*60)
     if phase1_keep_stem_trainable:
-        print("PHASE 1: Training classifier head + stem")
+        print("PHASE 1: Training fusion heads + stem")
     elif phase1_backbone_no_grad:
-        print("PHASE 1: Training classifier head (frozen backbone in no-grad mode)")
+        print("PHASE 1: Training fusion heads (frozen backbone in no-grad mode)")
     else:
-        print("PHASE 1: Training classifier head (backbone frozen)")
+        print("PHASE 1: Training fusion heads (backbone frozen)")
     print("="*60)
 
     model.freeze_backbone(keep_stem_trainable=phase1_keep_stem_trainable)
@@ -577,6 +708,7 @@ def main():
         forward_fn=phase1_forward_fn,
         early_stopping_patience=args.early_stopping_patience,
         resume=args.resume,
+        checkpoint_config=checkpoint_config,
     )
 
     # Load best Phase 1 weights before starting Phase 2
@@ -626,6 +758,7 @@ def main():
         forward_fn=None,
         early_stopping_patience=args.early_stopping_patience,
         resume=args.resume,
+        checkpoint_config=checkpoint_config,
     )
 
     # ════════════════════════════════════════════════════════════════════════

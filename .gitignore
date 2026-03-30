@@ -1,6 +1,9 @@
 data/synthetic
 data/photos
 data/fonts
+results/inference*/
+results/adversarial_eval_phase3/mispredictions/
+results/pipeline_visuals/
 .vscode/
 __pycache__/
 *.pyc

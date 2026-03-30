@@ -1,0 +1,21 @@
+{
+  "model_name": "roi_fusion_efficientnet_b0",
+  "label_names": [
+    "authentic",
+    "class1_photo",
+    "class2_name",
+    "class4_overlay"
+  ],
+  "target_size": [
+    800,
+    600
+  ],
+  "use_ela": true,
+  "use_coord_channels": true,
+  "ela_quality": 90,
+  "ela_scale": 12.0,
+  "adversarial_prob": 0.3,
+  "adversarial_jpeg_min_quality": 40,
+  "adversarial_jpeg_max_quality": 60,
+  "in_channels": 6
+}

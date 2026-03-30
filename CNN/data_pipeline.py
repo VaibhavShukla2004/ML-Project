@@ -3,10 +3,11 @@ from pathlib import Path
 import random
 from io import BytesIO
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset, Subset
 from torchvision import transforms
-from PIL import Image, ImageChops
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter
 
 try:
     from dataset import DocumentDataset, LABEL_MAP
@@ -22,6 +23,172 @@ RGB_MEAN = [0.485, 0.456, 0.406]
 RGB_STD = [0.229, 0.224, 0.225]
 ELA_MEAN = 0.5
 ELA_STD = 0.25
+COORD_MEAN = 0.5
+COORD_STD = 0.5
+DEFAULT_ADVERSARIAL_PROB = 0.3
+DEFAULT_ADVERSARIAL_JPEG_MIN_QUALITY = 40
+DEFAULT_ADVERSARIAL_JPEG_MAX_QUALITY = 60
+
+# Adversarial attack recipes: sequence of attacks to compose
+ADV_RECIPES = {
+    'glare_jpeg': ('glare', 'jpeg', 'contrast'),
+    'shadow_noise': ('shadow', 'noise', 'sharpness'),
+    'compression_stack': ('jpeg', 'jpeg', 'noise'),
+    'lighting_shift': ('gamma', 'contrast', 'shadow'),
+    'hard_phone_capture': ('perspective', 'glare', 'jpeg', 'noise'),
+    'washed_scan': ('contrast', 'blur', 'jpeg'),
+}
+
+
+# ---------------------------------------------------------------------------
+# Adversarial Attack Functions (ported from adversarial_generator.py)
+# ---------------------------------------------------------------------------
+
+def _apply_glare(image, rng):
+    """Simulate lens glare on document via diagonal white stripe."""
+    width, height = image.size
+    overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    glare_width = rng.randint(max(40, width // 10), max(80, width // 4))
+    center = rng.randint(width // 4, (3 * width) // 4)
+    for step in range(glare_width):
+        alpha = int(150 * (1.0 - abs((2.0 * step / max(glare_width - 1, 1)) - 1.0)))
+        draw.line(
+            ((center + step - glare_width // 2, 0), (center + step, height)),
+            fill=(255, 255, 255, max(alpha, 0)),
+            width=3,
+        )
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=max(6, width // 80)))
+    return Image.alpha_composite(image.convert('RGBA'), overlay).convert('RGB')
+
+
+def _apply_shadow(image, rng):
+    """Simulate scanner/lighting shadow via horizontal dark band."""
+    width, height = image.size
+    overlay = Image.new('RGBA', image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    start_y = rng.randint(0, height // 3)
+    end_y = rng.randint((2 * height) // 3, height)
+    for y in range(start_y, end_y):
+        alpha = int(110 * ((y - start_y) / max(end_y - start_y, 1)))
+        draw.line(((0, y), (width, y)), fill=(0, 0, 0, alpha), width=2)
+    overlay = overlay.filter(ImageFilter.GaussianBlur(radius=max(8, height // 90)))
+    return Image.alpha_composite(image.convert('RGBA'), overlay).convert('RGB')
+
+
+def _apply_noise(image, rng):
+    """Add Gaussian noise to pixels (lossy capture simulation)."""
+    array = np.asarray(image).astype(np.float32)
+    noise_std = rng.uniform(6.0, 20.0)
+    noise = np.random.default_rng(rng.randint(0, 1_000_000)).normal(0.0, noise_std, size=array.shape)
+    noisy = np.clip(array + noise, 0.0, 255.0).astype(np.uint8)
+    return Image.fromarray(noisy)
+
+
+def _apply_jpeg(image, rng, min_quality=DEFAULT_ADVERSARIAL_JPEG_MIN_QUALITY, max_quality=DEFAULT_ADVERSARIAL_JPEG_MAX_QUALITY):
+    """Apply moderate JPEG compression without fully destroying local compression signals."""
+    quality = rng.randint(min_quality, max_quality)
+    buffer = BytesIO()
+    image.save(buffer, format='JPEG', quality=quality)
+    buffer.seek(0)
+    return Image.open(buffer).convert('RGB')
+
+
+def _apply_contrast(image, rng):
+    """Randomly adjust contrast (bad lighting conditions)."""
+    factor = rng.uniform(0.65, 1.45)
+    return ImageEnhance.Contrast(image).enhance(factor)
+
+
+def _apply_sharpness(image, rng):
+    """Randomly adjust sharpness (OCR robustness)."""
+    factor = rng.uniform(0.4, 1.8)
+    return ImageEnhance.Sharpness(image).enhance(factor)
+
+
+def _apply_blur(image, rng):
+    """Apply Gaussian blur (out-of-focus capture)."""
+    radius = rng.uniform(0.6, 2.2)
+    return image.filter(ImageFilter.GaussianBlur(radius=radius))
+
+
+def _apply_gamma(image, rng):
+    """Adjust gamma curve (overexposed/underexposed scan)."""
+    gamma = rng.uniform(0.75, 1.35)
+    table = [min(255, max(0, int(((value / 255.0) ** gamma) * 255.0))) for value in range(256)]
+    return image.point(table * 3)
+
+
+def _apply_perspective(image, rng):
+    """Apply mild rotation + crop (skewed scan angle)."""
+    angle = rng.uniform(-3.5, 3.5)
+    translated = image.rotate(angle, resample=Image.Resampling.BICUBIC, expand=False, fillcolor=(242, 242, 242))
+    crop_x = rng.randint(0, max(1, image.size[0] // 40))
+    crop_y = rng.randint(0, max(1, image.size[1] // 40))
+    cropped = translated.crop((crop_x, crop_y, image.size[0], image.size[1]))
+    return cropped.resize(image.size, Image.Resampling.BICUBIC)
+
+
+class AdversarialAugmentation:
+    """
+    On-the-fly adversarial augmentation: only a fraction of training images are attacked.
+
+    Most samples stay clean so the model keeps a baseline for typography, geometry,
+    and localized compression artifacts. A minority are degraded to teach robustness.
+    """
+
+    def __init__(
+        self,
+        p=DEFAULT_ADVERSARIAL_PROB,
+        seed=None,
+        jpeg_min_quality=DEFAULT_ADVERSARIAL_JPEG_MIN_QUALITY,
+        jpeg_max_quality=DEFAULT_ADVERSARIAL_JPEG_MAX_QUALITY,
+    ):
+        if not 0.0 <= p <= 1.0:
+            raise ValueError(f'adversarial probability must be in [0, 1], got {p}')
+        if jpeg_min_quality < 1 or jpeg_max_quality > 100 or jpeg_min_quality > jpeg_max_quality:
+            raise ValueError(
+                'jpeg quality bounds must satisfy 1 <= min <= max <= 100, '
+                f'got {jpeg_min_quality}, {jpeg_max_quality}'
+            )
+
+        self.p = p
+        self.rng = random.Random(seed)
+        self.recipe_names = list(ADV_RECIPES.keys())
+        self.jpeg_min_quality = jpeg_min_quality
+        self.jpeg_max_quality = jpeg_max_quality
+        self.attack_map = {
+            'glare': _apply_glare,
+            'shadow': _apply_shadow,
+            'noise': _apply_noise,
+            'jpeg': self._apply_jpeg,
+            'contrast': _apply_contrast,
+            'sharpness': _apply_sharpness,
+            'blur': _apply_blur,
+            'gamma': _apply_gamma,
+            'perspective': _apply_perspective,
+        }
+
+    def _apply_jpeg(self, image, rng):
+        return _apply_jpeg(
+            image,
+            rng,
+            min_quality=self.jpeg_min_quality,
+            max_quality=self.jpeg_max_quality,
+        )
+
+    def apply_recipe(self, image, recipe_name):
+        variant = image.copy()
+        for attack_name in ADV_RECIPES[recipe_name]:
+            variant = self.attack_map[attack_name](variant, self.rng)
+        return variant
+
+    def __call__(self, image):
+        if self.rng.random() > self.p:
+            return image
+
+        recipe_name = self.rng.choice(self.recipe_names)
+        return self.apply_recipe(image, recipe_name)
 
 
 def _compute_ela_channel(image, ela_quality=90, ela_scale=12.0):
@@ -35,28 +202,64 @@ def _compute_ela_channel(image, ela_quality=90, ela_scale=12.0):
     return transforms.functional.to_tensor(ela)
 
 
-def _to_model_tensor(image, use_ela=False, ela_quality=90, ela_scale=12.0):
-    """Convert PIL image to normalized RGB tensor, optionally appending ELA channel."""
-    rgb = transforms.functional.to_tensor(image)
-    if not use_ela:
-        return transforms.functional.normalize(rgb, mean=RGB_MEAN, std=RGB_STD)
+def _compute_coordinate_channels(height, width, dtype):
+    """Generate normalized X/Y coordinate channels for CoordConv-style location cues."""
+    y_coords = torch.linspace(0.0, 1.0, steps=height, dtype=dtype).view(1, height, 1).expand(1, height, width)
+    x_coords = torch.linspace(0.0, 1.0, steps=width, dtype=dtype).view(1, 1, width).expand(1, height, width)
+    return torch.cat([x_coords, y_coords], dim=0)
 
-    ela = _compute_ela_channel(image, ela_quality=ela_quality, ela_scale=ela_scale)
-    stacked = torch.cat([rgb, ela], dim=0)
+
+def _to_model_tensor(
+    image,
+    use_ela=False,
+    ela_quality=90,
+    ela_scale=12.0,
+    use_coord_channels=False,
+):
+    """Convert PIL image to model tensor with optional ELA and coordinate channels."""
+    rgb = transforms.functional.to_tensor(image)
+    channels = [rgb]
+    mean = list(RGB_MEAN)
+    std = list(RGB_STD)
+
+    if use_ela:
+        ela = _compute_ela_channel(image, ela_quality=ela_quality, ela_scale=ela_scale)
+        channels.append(ela)
+        mean.append(ELA_MEAN)
+        std.append(ELA_STD)
+
+    if use_coord_channels:
+        coord_channels = _compute_coordinate_channels(
+            height=rgb.shape[1],
+            width=rgb.shape[2],
+            dtype=rgb.dtype,
+        )
+        channels.append(coord_channels)
+        mean.extend([COORD_MEAN, COORD_MEAN])
+        std.extend([COORD_STD, COORD_STD])
+
+    stacked = torch.cat(channels, dim=0)
     return transforms.functional.normalize(
         stacked,
-        mean=RGB_MEAN + [ELA_MEAN],
-        std=RGB_STD + [ELA_STD],
+        mean=mean,
+        std=std,
     )
 
 
-def make_train_transform(target_size=DEFAULT_TARGET_SIZE, use_ela=False, ela_quality=90, ela_scale=12.0):
+def make_train_transform(
+    target_size=DEFAULT_TARGET_SIZE,
+    use_ela=False,
+    ela_quality=90,
+    ela_scale=12.0,
+    use_coord_channels=False,
+):
     return make_train_transform_with_profile(
         target_size=target_size,
         train_augmentation='full',
         use_ela=use_ela,
         ela_quality=ela_quality,
         ela_scale=ela_scale,
+        use_coord_channels=use_coord_channels,
     )
 
 
@@ -66,9 +269,18 @@ def make_train_transform_with_profile(
     use_ela=False,
     ela_quality=90,
     ela_scale=12.0,
+    use_coord_channels=False,
+    adversarial_seed=None,
+    adversarial_prob=DEFAULT_ADVERSARIAL_PROB,
+    adversarial_jpeg_min_quality=DEFAULT_ADVERSARIAL_JPEG_MIN_QUALITY,
+    adversarial_jpeg_max_quality=DEFAULT_ADVERSARIAL_JPEG_MAX_QUALITY,
 ):
-    if train_augmentation not in {'full', 'light', 'none'}:
-        raise ValueError("train_augmentation must be one of: full, light, none")
+    if train_augmentation not in {'full', 'light', 'none', 'adversarial'}:
+        raise ValueError("train_augmentation must be one of: full, light, none, adversarial")
+
+    # ROI heads assume a stable card layout, so horizontal flips would create invalid supervision.
+    light_horizontal_flip = transforms.RandomHorizontalFlip(p=0.0)
+    full_horizontal_flip = transforms.RandomHorizontalFlip(p=0.0)
 
     tensorize = transforms.Lambda(
         lambda img: _to_model_tensor(
@@ -76,6 +288,7 @@ def make_train_transform_with_profile(
             use_ela=use_ela,
             ela_quality=ela_quality,
             ela_scale=ela_scale,
+            use_coord_channels=use_coord_channels,
         )
     )
 
@@ -88,21 +301,44 @@ def make_train_transform_with_profile(
     if train_augmentation == 'light':
         return transforms.Compose([
             transforms.Resize(target_size),
-            transforms.RandomHorizontalFlip(p=0.2),
+            light_horizontal_flip,
             tensorize,
         ])
 
+    if train_augmentation == 'adversarial':
+        return transforms.Compose([
+            transforms.Resize(target_size),
+            AdversarialAugmentation(
+                p=adversarial_prob,
+                seed=adversarial_seed,
+                jpeg_min_quality=adversarial_jpeg_min_quality,
+                jpeg_max_quality=adversarial_jpeg_max_quality,
+            ),
+            transforms.RandomRotation(degrees=3),
+            full_horizontal_flip,
+            transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+            tensorize,
+        ])
+
+    # Default 'full' mode: standard augmentation without adversarial attacks
     return transforms.Compose([
         transforms.Resize(target_size),
         transforms.RandomRotation(degrees=3),
-        transforms.RandomHorizontalFlip(p=0.3),
+        full_horizontal_flip,
         transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.1),
         transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
         tensorize,
     ])
 
 
-def make_eval_transform(target_size=DEFAULT_TARGET_SIZE, use_ela=False, ela_quality=90, ela_scale=12.0):
+def make_eval_transform(
+    target_size=DEFAULT_TARGET_SIZE,
+    use_ela=False,
+    ela_quality=90,
+    ela_scale=12.0,
+    use_coord_channels=False,
+):
     return transforms.Compose([
         transforms.Resize(target_size),
         transforms.Lambda(
@@ -111,6 +347,7 @@ def make_eval_transform(target_size=DEFAULT_TARGET_SIZE, use_ela=False, ela_qual
                 use_ela=use_ela,
                 ela_quality=ela_quality,
                 ela_scale=ela_scale,
+                use_coord_channels=use_coord_channels,
             )
         ),
     ])
@@ -193,6 +430,11 @@ def build_splits(
     use_ela=False,
     ela_quality=90,
     ela_scale=12.0,
+    use_coord_channels=False,
+    adversarial_seed=None,
+    adversarial_prob=DEFAULT_ADVERSARIAL_PROB,
+    adversarial_jpeg_min_quality=DEFAULT_ADVERSARIAL_JPEG_MIN_QUALITY,
+    adversarial_jpeg_max_quality=DEFAULT_ADVERSARIAL_JPEG_MAX_QUALITY,
 ):
     full_dataset = DocumentDataset(
         authentic_dir=authentic_dir,
@@ -223,6 +465,11 @@ def build_splits(
             use_ela=use_ela,
             ela_quality=ela_quality,
             ela_scale=ela_scale,
+            use_coord_channels=use_coord_channels,
+            adversarial_seed=adversarial_seed,
+            adversarial_prob=adversarial_prob,
+            adversarial_jpeg_min_quality=adversarial_jpeg_min_quality,
+            adversarial_jpeg_max_quality=adversarial_jpeg_max_quality,
         ),
     )
     val_set = TransformSubset(
@@ -232,6 +479,7 @@ def build_splits(
             use_ela=use_ela,
             ela_quality=ela_quality,
             ela_scale=ela_scale,
+            use_coord_channels=use_coord_channels,
         ),
     )
     test_set = TransformSubset(
@@ -241,6 +489,7 @@ def build_splits(
             use_ela=use_ela,
             ela_quality=ela_quality,
             ela_scale=ela_scale,
+            use_coord_channels=use_coord_channels,
         ),
     )
 
@@ -357,6 +606,11 @@ def build_pipeline(
     use_ela=False,
     ela_quality=90,
     ela_scale=12.0,
+    use_coord_channels=False,
+    adversarial_seed=None,
+    adversarial_prob=DEFAULT_ADVERSARIAL_PROB,
+    adversarial_jpeg_min_quality=DEFAULT_ADVERSARIAL_JPEG_MIN_QUALITY,
+    adversarial_jpeg_max_quality=DEFAULT_ADVERSARIAL_JPEG_MAX_QUALITY,
 ):
     full_dataset, train_set, val_set, test_set = build_splits(
         authentic_dir=authentic_dir,
@@ -367,6 +621,11 @@ def build_pipeline(
         use_ela=use_ela,
         ela_quality=ela_quality,
         ela_scale=ela_scale,
+        use_coord_channels=use_coord_channels,
+        adversarial_seed=adversarial_seed,
+        adversarial_prob=adversarial_prob,
+        adversarial_jpeg_min_quality=adversarial_jpeg_min_quality,
+        adversarial_jpeg_max_quality=adversarial_jpeg_max_quality,
     )
     train_loader, val_loader, test_loader = build_dataloaders(
         train_set=train_set,
@@ -388,7 +647,7 @@ def build_pipeline(
         "val_loader": val_loader,
         "test_loader": test_loader,
         "class_weights": compute_class_weights(train_set),
-        "in_channels": 4 if use_ela else 3,
+        "in_channels": 3 + int(use_ela) + (2 if use_coord_channels else 0),
     }
 
 
